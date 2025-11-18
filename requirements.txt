@@ -4,3 +4,5 @@ langchain-chroma
 langchain-community
 chromadb
 pypdf
+langchain-text-splitters
+python-dotenv
