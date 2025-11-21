@@ -1,4 +1,6 @@
+import json
 import os
+from collections import OrderedDict
 
 from azure.ai.inference import ChatCompletionsClient
 from azure.core.credentials import AzureKeyCredential
@@ -16,9 +18,43 @@ load_dotenv()
 
 PROMPT_TEMPLATE = os.getenv(
     "PROMPT_TEMPLATE",
-    "Voce e um assistente util que usa somente o contexto da base selecionada.\n"
-    "Use todas as bases juntas apenas se o usuario pedir explicitamente.\n\n"
-    "Contexto:\n{context}\n\nPergunta: {question}",
+    (
+        "Voce e um assistente util que usa somente o contexto da base selecionada.\n"
+        "Use todas as bases juntas apenas se o usuario pedir explicitamente.\n"
+        "Responda SEMPRE em JSON seguindo o schema:\n"
+        "{{\n"
+        '  "answer": "<texto da resposta ou vazio>",\n'
+        '  "datasets": ["<nome_dataset_usado>", ...],\n'
+        '  "error": "<mensagem de erro ou null>"\n'
+        "}}\n"
+        "Regras:\n"
+        "Se o contexto nao trouxer informacoes suficientes, deixe \"answer\" vazio e descreva o motivo em \"error\".\n"
+        "Se \"answer\" for NAO VAZIO entao obrigatoriamente coloque \"error\": null.\n"
+        "Nunca invente dados fora do contexto.\n"
+        "Mencione todos os datasets realmente usados no array \"datasets\".\n\n"
+        "Contexto:\n{context}\n\nPergunta: {question}"
+    ),
+).replace("\\n", "\n")
+
+CLASSIFIER_PROMPT_TEMPLATE = os.getenv(
+    "CLASSIFIER_PROMPT_TEMPLATE",
+    (
+        "Voce e um agente que escolhe qual dataset utilizar antes da resposta final.\n"
+        "Bases disponiveis (slug, nome amigavel e PDFs):\n{datasets}\n\n"
+        "Responda SEMPRE em JSON seguindo o schema:\n"
+        "{{\n"
+        '  "collection": "<slug-ou-all>",\n'
+        '  "mode": "rag|summary",\n'
+        '  "error": "<mensagem de erro ou null>"\n'
+        "}}\n"
+        "Regras:\n"
+        "Use 'summary' quando o usuario pedir um resumo/visao geral ou quando o recurso exigir o contexto completo do dataset (ex.: 'resumo', 'sumario', 'visao geral', 'overview').\n"
+        "Use 'rag' para perguntas especificas que podem ser atendidas por busca semantica (retorne os blocos mais relevantes).\n"
+        "Use collection='all' apenas se o usuario pedir explicitamente por todas as bases/arquivos.\n"
+        "Nao invente colecoes; escolha um slug listado ou 'all'.\n"
+        "Se estiver em duvida, prefira collection='all' e mode='rag'.\n\n"
+        "Pergunta do usuario: {question}"
+    ),
 ).replace("\\n", "\n")
 
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -34,6 +70,10 @@ chat_client = ChatCompletionsClient(
     endpoint=AZURE_OPENAI_ENDPOINT,
     credential=AzureKeyCredential(AZURE_OPENAI_API_KEY),
 )
+
+BASE_DATASETS = [dataset for dataset in AVAILABLE_DATASETS if dataset != "all"]
+CLASSIFIER_CACHE_LIMIT = 25
+CLASSIFIER_CACHE: "OrderedDict[str, dict]" = OrderedDict()
 
 
 def _format_prompt(context: str, question: str) -> str:
@@ -71,43 +111,83 @@ def _call_model(prompt_text: str) -> str:
             text_blocks.append(str(block))
     return "".join(part for part in text_blocks if part).strip()
 
-BASE_DATASETS = [dataset for dataset in AVAILABLE_DATASETS if dataset != "all"]
-MANUAL_KEYWORDS = ("manual", "guia")
-BOOK_KEYWORDS = ("livro",)
-FULL_CONTEXT_KEYWORDS = ("resumo",)
-
-
-def _find_dataset_for_keywords(keywords, exclude=None):
-    exclude = set(exclude or [])
-    normalized_keywords = tuple(keyword.lower() for keyword in keywords)
+def _build_dataset_guide_text() -> str:
+    lines = []
     for dataset in BASE_DATASETS:
-        if dataset in exclude:
-            continue
-        label = DATASET_LABELS.get(dataset, dataset).lower()
-        slug = dataset.lower()
-        sources_text = " ".join(DATASET_SOURCES.get(dataset, [])).lower()
-        haystack = f"{label} {slug} {sources_text}"
-        if any(keyword in haystack for keyword in normalized_keywords):
-            return dataset
-    return None
+        label = DATASET_LABELS.get(dataset, dataset)
+        sources = DATASET_SOURCES.get(dataset) or []
+        if sources:
+            preview = ", ".join(sources[:5])
+            if len(sources) > 5:
+                preview += ", ..."
+            sources_text = f"PDFs: {preview}"
+        else:
+            sources_text = "PDFs: nao especificados"
+        lines.append(f"- {dataset}: {label}. {sources_text}")
+    if not lines:
+        return "- (nenhuma base cadastrada)"
+    lines.append("- all: Todas as bases. Use apenas se explicitamente solicitado.")
+    return "\n".join(lines)
 
 
-MANUAL_DATASET = _find_dataset_for_keywords(MANUAL_KEYWORDS) or (BASE_DATASETS[0] if BASE_DATASETS else "all")
-BOOK_DATASET_DEFAULT = next((dataset for dataset in BASE_DATASETS if dataset != MANUAL_DATASET), MANUAL_DATASET)
+def _extract_classifier_payload(raw_text: str) -> dict:
+    if not raw_text:
+        return {}
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        start = raw_text.find("{")
+        end = raw_text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = raw_text[start : end + 1]
+            try:
+                return json.loads(snippet)
+            except json.JSONDecodeError:
+                return {}
+        return {}
 
 
-def _pick_dataset(question: str) -> str:
-    normalized = question.lower()
-    if "todos os arquivos" in normalized:
-        return "all"
-    if any(keyword in normalized for keyword in MANUAL_KEYWORDS):
-        return MANUAL_DATASET or "all"
-    if any(keyword in normalized for keyword in BOOK_KEYWORDS):
-        candidate = _find_dataset_for_keywords(BOOK_KEYWORDS, exclude={MANUAL_DATASET})
-        if candidate:
-            return candidate
-        return BOOK_DATASET_DEFAULT or "all"
-    return "all"
+def _remember_classification(key: str, value: dict) -> None:
+    CLASSIFIER_CACHE[key] = value
+    CLASSIFIER_CACHE.move_to_end(key)
+    while len(CLASSIFIER_CACHE) > CLASSIFIER_CACHE_LIMIT:
+        CLASSIFIER_CACHE.popitem(last=False)
+
+
+def _get_cached_classification(key: str):
+    cached = CLASSIFIER_CACHE.get(key)
+    if cached is None:
+        return None
+    CLASSIFIER_CACHE.move_to_end(key)
+    return dict(cached)
+
+
+def _classify_request(question: str) -> dict:
+    normalized = question.strip().lower()
+    if not normalized:
+        return {"collection": "all", "mode": "rag"}
+
+    cached = _get_cached_classification(normalized)
+    if cached:
+        return cached
+
+    dataset_guide = _build_dataset_guide_text()
+    prompt = CLASSIFIER_PROMPT_TEMPLATE.format(datasets=dataset_guide, question=question.strip())
+    raw_response = _call_model(prompt)
+    payload = _extract_classifier_payload(raw_response)
+    collection = (payload.get("collection") or "all").strip().lower()
+    mode = (payload.get("mode") or "rag").strip().lower()
+
+    if collection not in AVAILABLE_DATASETS:
+        collection = "all"
+    if mode not in {"rag", "summary"}:
+        mode = "rag"
+    if collection == "all" and mode == "summary":
+        mode = "rag"
+
+    result = {"collection": collection, "mode": mode}
+    _remember_classification(normalized, result)
+    return result
 
 
 while True:
@@ -117,9 +197,9 @@ while True:
     if question == 'q':
         break
 
-    normalized_question = question.lower()
-    dataset = _pick_dataset(question)
-    use_full_context = any(keyword in normalized_question for keyword in FULL_CONTEXT_KEYWORDS)
+    classification = _classify_request(question)
+    dataset = classification["collection"]
+    use_full_context = classification["mode"] == "summary"
 
     if use_full_context:
         if dataset == "all":
@@ -167,7 +247,8 @@ while True:
             )
 
     selected_label = DATASET_LABELS.get(dataset, dataset)
-    print(f"Dataset selecionado: {selected_label}")
+    mode_label = "summary" if use_full_context else "rag"
+    print(f"Dataset selecionado: {selected_label} | modo: {mode_label}")
     print(f"Tamanho do contexto: {len(context_text)} caracteres")
     prompt_text = _format_prompt(context_text, question)
     result = _call_model(prompt_text)
