@@ -1,8 +1,8 @@
 import os
 
+from azure.ai.inference import ChatCompletionsClient
+from azure.core.credentials import AzureKeyCredential
 from dotenv import load_dotenv
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama.llms import OllamaLLM
 
 from vector import (
     AVAILABLE_DATASETS,
@@ -14,7 +14,6 @@ from vector import (
 
 load_dotenv()
 
-MODEL_NAME = os.getenv("LLM_MODEL", "llama3.2")
 PROMPT_TEMPLATE = os.getenv(
     "PROMPT_TEMPLATE",
     "Voce e um assistente util que usa somente o contexto da base selecionada.\n"
@@ -22,9 +21,55 @@ PROMPT_TEMPLATE = os.getenv(
     "Contexto:\n{context}\n\nPergunta: {question}",
 ).replace("\\n", "\n")
 
-model = OllamaLLM(model=MODEL_NAME)
-prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-chain = prompt | model
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+
+if not all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT]):
+    raise RuntimeError(
+        "Variaveis AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY e AZURE_OPENAI_DEPLOYMENT sao obrigatorias."
+    )
+
+chat_client = ChatCompletionsClient(
+    endpoint=AZURE_OPENAI_ENDPOINT,
+    credential=AzureKeyCredential(AZURE_OPENAI_API_KEY),
+)
+
+
+def _format_prompt(context: str, question: str) -> str:
+    return PROMPT_TEMPLATE.format(context=context, question=question)
+
+
+def _call_model(prompt_text: str) -> str:
+    response = chat_client.complete(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt_text,
+                    }
+                ],
+            }
+        ],
+    )
+    if not response.choices:
+        return ""
+    choice = response.choices[0]
+    message = getattr(choice, "message", None)
+    if not message or not message.content:
+        return ""
+    text_blocks = []
+    for block in message.content:
+        if hasattr(block, "text") and block.text:
+            text_blocks.append(block.text)
+        elif isinstance(block, dict) and block.get("text"):
+            text_blocks.append(str(block["text"]))
+        else:
+            text_blocks.append(str(block))
+    return "".join(part for part in text_blocks if part).strip()
 
 BASE_DATASETS = [dataset for dataset in AVAILABLE_DATASETS if dataset != "all"]
 MANUAL_KEYWORDS = ("manual", "guia")
@@ -124,8 +169,6 @@ while True:
     selected_label = DATASET_LABELS.get(dataset, dataset)
     print(f"Dataset selecionado: {selected_label}")
     print(f"Tamanho do contexto: {len(context_text)} caracteres")
-    #print("----------------------------")
-    #print(context_text)
-    #print("----------------------------")
-    result = chain.invoke({"context": context_text, "question": question})
+    prompt_text = _format_prompt(context_text, question)
+    result = _call_model(prompt_text)
     print(result)

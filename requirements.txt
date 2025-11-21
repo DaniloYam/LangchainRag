@@ -6,3 +6,4 @@ chromadb
 pypdf
 langchain-text-splitters
 python-dotenv
+azure-ai-inference
