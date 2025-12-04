@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 from collections import OrderedDict
@@ -76,6 +77,86 @@ CLASSIFIER_CACHE_LIMIT = 25
 CLASSIFIER_CACHE: "OrderedDict[str, dict]" = OrderedDict()
 
 
+def _load_access_rules(path: str) -> dict:
+    if not os.path.exists(path):
+        raise RuntimeError(f"Arquivo de regras de acesso '{path}' nao encontrado.")
+    try:
+        with open(path, "r", encoding="utf-8") as handler:
+            payload = json.load(handler)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Arquivo de regras '{path}' com JSON invalido.") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Arquivo de regras '{path}' deve conter um objeto JSON na raiz.")
+    return payload
+
+
+parser = argparse.ArgumentParser(description="RAG com controle de acesso por usuario")
+parser.add_argument("user", help="Identificador do usuario (ex.: joao, pedro, ana)")
+parser.add_argument(
+    "--access-file",
+    default=os.getenv("ACCESS_RULES_PATH", "access_rules.json"),
+    help="Caminho para o arquivo JSON com a lista de datasets permitidos por usuario",
+)
+args = parser.parse_args()
+
+ACCESS_RULES = _load_access_rules(args.access_file)
+CURRENT_USER = args.user.strip().lower()
+USER_RULE = ACCESS_RULES.get(CURRENT_USER)
+if USER_RULE is None:
+    raise RuntimeError(
+        f"Usuario '{CURRENT_USER}' sem datasets configurados em '{args.access_file}'."
+    )
+
+
+def _normalize_access_rule(rule):
+    if isinstance(rule, dict):
+        datasets = rule.get("datasets")
+        force_all = bool(rule.get("force_all"))
+    elif isinstance(rule, list):
+        datasets = rule
+        force_all = False
+    else:
+        raise RuntimeError(
+            "Cada regra de acesso deve ser uma lista de datasets ou um objeto com o campo 'datasets'."
+        )
+    if not isinstance(datasets, list) or not datasets:
+        raise RuntimeError("Campo 'datasets' deve ser uma lista nao vazia de slugs.")
+    return {
+        "datasets": [dataset.strip().lower() for dataset in datasets],
+        "force_all": force_all,
+    }
+
+
+NORMALIZED_RULE = _normalize_access_rule(USER_RULE)
+ALLOWED_DATASETS = set(NORMALIZED_RULE["datasets"])
+FORCE_ALL_DATASETS = NORMALIZED_RULE["force_all"] and "all" in ALLOWED_DATASETS
+
+unknown_datasets = ALLOWED_DATASETS.difference(AVAILABLE_DATASETS)
+if unknown_datasets:
+    raise RuntimeError(
+        f"Datasets desconhecidos para o usuario '{CURRENT_USER}': {sorted(unknown_datasets)}."
+    )
+
+USER_DATASET_LIST = tuple(sorted(ALLOWED_DATASETS))
+USER_BASE_DATASETS = tuple(dataset for dataset in USER_DATASET_LIST if dataset != "all")
+if FORCE_ALL_DATASETS:
+    DEFAULT_DATASET = "all"
+else:
+    DEFAULT_DATASET = USER_BASE_DATASETS[0] if USER_BASE_DATASETS else "all"
+
+
+def _format_allowed() -> str:
+    labels = []
+    for dataset in sorted(ALLOWED_DATASETS):
+        labels.append(DATASET_LABELS.get(dataset, dataset))
+    return ", ".join(labels)
+
+
+print(
+    f"Usuario ativo: {CURRENT_USER} | Bases permitidas: {_format_allowed() or 'nenhuma configurada'}"
+)
+
+
 def _format_prompt(context: str, question: str) -> str:
     return PROMPT_TEMPLATE.format(context=context, question=question)
 
@@ -113,7 +194,7 @@ def _call_model(prompt_text: str) -> str:
 
 def _build_dataset_guide_text() -> str:
     lines = []
-    for dataset in BASE_DATASETS:
+    for dataset in USER_BASE_DATASETS:
         label = DATASET_LABELS.get(dataset, dataset)
         sources = DATASET_SOURCES.get(dataset) or []
         if sources:
@@ -124,9 +205,10 @@ def _build_dataset_guide_text() -> str:
         else:
             sources_text = "PDFs: nao especificados"
         lines.append(f"- {dataset}: {label}. {sources_text}")
+    if "all" in ALLOWED_DATASETS:
+        lines.append("- all: Todas as bases permitidas para este usuario. Use apenas se explicitamente solicitado.")
     if not lines:
-        return "- (nenhuma base cadastrada)"
-    lines.append("- all: Todas as bases. Use apenas se explicitamente solicitado.")
+        return "- (nenhuma base cadastrada para este usuario)"
     return "\n".join(lines)
 
 
@@ -185,6 +267,11 @@ def _classify_request(question: str) -> dict:
     if collection == "all" and mode == "summary":
         mode = "rag"
 
+    if FORCE_ALL_DATASETS:
+        collection = "all"
+    elif collection not in ALLOWED_DATASETS:
+        collection = DEFAULT_DATASET
+
     result = {"collection": collection, "mode": mode}
     _remember_classification(normalized, result)
     return result
@@ -204,9 +291,8 @@ while True:
     if use_full_context:
         if dataset == "all":
             docs = []
-            for name in AVAILABLE_DATASETS:
-                if name == "all":
-                    continue
+            target_collections = USER_BASE_DATASETS or BASE_DATASETS
+            for name in target_collections:
                 docs.extend(get_all_documents(name))
         else:
             docs = get_all_documents(dataset)
@@ -229,9 +315,8 @@ while True:
 
     if dataset == "all" and DATASET_SOURCES:
         source_lines = []
-        for name in AVAILABLE_DATASETS:
-            if name == "all":
-                continue
+        target_collections = USER_BASE_DATASETS or BASE_DATASETS
+        for name in target_collections:
             sources = DATASET_SOURCES.get(name)
             if not sources:
                 continue

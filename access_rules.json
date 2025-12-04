@@ -1,0 +1,8 @@
+{
+  "joao": ["financeiro_pdf"],
+  "pedro": ["comercial_pdf"],
+  "ana": {
+    "datasets": ["financeiro_pdf", "comercial_pdf", "all"],
+    "force_all": true
+  }
+}
